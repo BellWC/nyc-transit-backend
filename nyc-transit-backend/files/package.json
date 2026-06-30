@@ -1,9 +1,0 @@
-{
-  "name": "nyc-transit-backend",
-  "version": "1.0.0",
-  "private": true,
-  "dependencies": {
-    "gtfs-realtime-bindings": "^1.1.1",
-    "jszip": "^3.10.1"
-  }
-}
