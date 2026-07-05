@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+  <meta name="theme-color" content="#0a0a0b" />
+  <title>NYC Transit</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Fraunces:opsz,wght@9..144,500;9..144,700&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body, #root { height: 100%; }
+    body { background: #0a0a0b; color: #F2F1ED; font-family: 'Inter', sans-serif; -webkit-font-smoothing: antialiased; }
+    select { -webkit-appearance: none; appearance: none; }
+    input::placeholder { color: #5a5a5f; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.development.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.development.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+
+  <script type="text/babel">
+    const { useState, useEffect } = React;
+    const API_BASE = "https://nyc-transit-backend.vercel.app";
+
+    async function fetchNearbyStations(lat, lng, r = 0.25) {
+      const res = await fetch(`${API_BASE}/api/stations?lat=${lat}&lng=${lng}&radiusMiles=${r}`);
+      if (!res.ok) throw new Error("failed"); return res.json();
+    }
+    async function fetchNearbyBusStops(lat, lng, r = 0.25) {
+      const res = await fetch(`${API_BASE}/api/bus-stops?lat=${lat}&lng=${lng}&radiusMiles=${r}`);
+      if (!res.ok) throw new Error("failed"); return res.json();
+    }
+    function getUserLocation() {
+      return new Promise((resolve, reject) => {
+        if (!navigator.geolocation) { reject(new Error("unsupported")); return; }
+        navigator.geolocation.getCurrentPosition(
+          (p) => resolve({ lat: p.coords.latitude, lng: p.coords.longitude }),
+          (e) => reject(e), { enableHighAccuracy: true, timeout: 8000 }
+        );
+      });
+    }
+    async function fetchSubwayArrivals(group) {
+      const res = await fetch(`${API_BASE}/api/subway?group=${group}`);
+      if (!res.ok) throw new Error("failed"); return res.json();
+    }
+    async function fetchBusArrivals(stopId) {
+      const res = await fetch(`${API_BASE}/api/bus?stopId=${stopId}`);
+      if (!res.ok) throw new Error("failed"); return res.json();
+    }
+    async function fetchAllSubwayArrivalsMerged() {
+      const groups = ["ace","bdfm","g","jz","nqrw","l","123456s","7"];
+      const results = await Promise.allSettled(groups.map(fetchSubwayArrivals));
+      const merged = [];
+      results.forEach((r) => { if (r.status === "fulfilled") merged.push(...r.value.arrivals); });
+      return merged;
+    }
+    async function searchStations(text) {
+      const [s, b] = await Promise.all([
+        fetch(`${API_BASE}/api/stations?query=${encodeURIComponent(text)}`).then(r => r.json()),
+        fetch(`${API_BASE}/api/bus-stops?query=${encodeURIComponent(text)}`).then(r => r.json()),
+      ]);
+      return { stations: (s.stations||[]).slice(0,8), busStops: (b.stops||[]).slice(0,8) };
+    }
+    async function fetchAlertsLive() {
+      const res = await fetch(`${API_BASE}/api/alerts`);
+      if (!res.ok) throw new Error("failed"); return res.json();
+    }
+
+    const STATION_GRAPH = {
+      "Union Sq": { edges: [{ to:"14 St (8 Av)", line:"L", mins:3},{ to:"Times Sq", line:"N", mins:8},{ to:"Atlantic Av", line:"4", mins:12},{ to:"Grand Central", line:"6", mins:5}]},
+      "14 St (8 Av)": { edges: [{ to:"Union Sq", line:"L", mins:3},{ to:"Times Sq", line:"A", mins:6}]},
+      "Times Sq": { edges: [{ to:"Union Sq", line:"N", mins:8},{ to:"14 St (8 Av)", line:"A", mins:6},{ to:"Grand Central", line:"7", mins:4},{ to:"Jackson Hts", line:"7", mins:15}]},
+      "Grand Central": { edges: [{ to:"Union Sq", line:"6", mins:5},{ to:"Times Sq", line:"7", mins:4},{ to:"Atlantic Av", line:"4", mins:18}]},
+      "Atlantic Av": { edges: [{ to:"Union Sq", line:"4", mins:12},{ to:"Grand Central", line:"4", mins:18},{ to:"Jackson Hts", line:"R", mins:22}]},
+      "Jackson Hts": { edges: [{ to:"Times Sq", line:"7", mins:15},{ to:"Atlantic Av", line:"R", mins:22}]},
+    };
+
+    function findRoutes(origin, dest, limit=3) {
+      if (!STATION_GRAPH[origin]||!STATION_GRAPH[dest]||origin===dest) return [];
+      function dijkstra(blocked=null) {
+        const dist={},prevLine={},prevNode={};
+        Object.keys(STATION_GRAPH).forEach(n=>dist[n]=Infinity);
+        dist[origin]=0; const visited=new Set();
+        while(visited.size<Object.keys(STATION_GRAPH).length){
+          let cur=null,best=Infinity;
+          for(const n of Object.keys(STATION_GRAPH)) if(!visited.has(n)&&dist[n]<best){best=dist[n];cur=n;}
+          if(!cur)break; visited.add(cur);
+          for(const e of STATION_GRAPH[cur].edges){
+            if(cur===origin&&e.to===blocked)continue;
+            const sw=prevLine[cur]&&prevLine[cur]!==e.line;
+            const nd=dist[cur]+e.mins+(sw?4:0);
+            if(nd<dist[e.to]){dist[e.to]=nd;prevNode[e.to]=cur;prevLine[e.to]=e.line;}
+          }
+        }
+        if(dist[dest]===Infinity)return null;
+        const path=[];let n=dest;
+        while(n!==origin){const f=prevNode[n];if(!f)return null;path.unshift({from:f,to:n,line:prevLine[n]});n=f;}
+        const transfers=path.reduce((c,l,i)=>i===0?0:l.line!==path[i-1].line?c+1:c,0);
+        return {totalMins:Math.round(dist[dest]),legs:path,transfers};
+      }
+      const routes=[],seen=new Set();
+      const p=dijkstra(); if(p){routes.push(p);seen.add(JSON.stringify(p.legs.map(l=>l.line)));}
+      let blocker=p?.legs?.[0]?.to||null;
+      for(let i=0;i<limit-1&&blocker;i++){
+        const a=dijkstra(blocker);
+        if(a){const k=JSON.stringify(a.legs.map(l=>l.line));if(!seen.has(k)){routes.push(a);seen.add(k);}}
+        blocker=a?.legs?.[0]?.to||null;
+      }
+      return routes.sort((a,b)=>a.totalMins-b.totalMins).slice(0,limit);
+    }
+
+    const LINE_COLORS = {
+      "1":"#EE352E","2":"#EE352E","3":"#EE352E","4":"#00933C","5":"#00933C","6":"#00933C","7":"#B933AD",
+      "A":"#2850AD","C":"#2850AD","E":"#2850AD","B":"#FF6319","D":"#FF6319","F":"#FF6319","M":"#FF6319",
+      "G":"#6CBE45","J":"#996633","Z":"#996633","L":"#A7A9AC",
+      "N":"#FCCC0A","Q":"#FCCC0A","R":"#FCCC0A","W":"#FCCC0A","BUS":"#0039A6","SI":"#0039A6",
+    };
+
+    function Bullet({ line, size=24 }) {
+      return (
+        <div style={{width:size,height:size,borderRadius:line==="BUS"?6:"50%",background:LINE_COLORS[line]||"#888",color:"#fff",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:700,fontSize:size*0.48,fontFamily:"Helvetica Neue,Arial,sans-serif",flexShrink:0}}>
+          {line==="BUS"?"B":line}
+        </div>
+      );
+    }
+
+    function PaywallModal({ onClose, reason }) {
+      return (
+        <div onClick={onClose} style={{position:"fixed",inset:0,background:"rgba(8,8,9,0.82)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:50,padding:20}}>
+          <div onClick={e=>e.stopPropagation()} style={{background:"#121214",border:"1px solid #2a2a2d",borderRadius:16,maxWidth:380,width:"100%",padding:"28px 24px"}}>
+            <div style={{fontSize:13,letterSpacing:1,color:"#FCCC0A",textTransform:"uppercase",marginBottom:8}}>🔒 Past your free range</div>
+            <h2 style={{fontFamily:"Fraunces,serif",fontSize:24,margin:"0 0 10px",lineHeight:1.2}}>{reason}</h2>
+            <p style={{color:"#b3b3b8",fontSize:14,lineHeight:1.55,margin:"0 0 16px"}}>
+              Free shows everything within a quarter mile. Go further, save unlimited routes, and get push alerts with <strong style={{color:"#F2F1ED"}}>Transit+</strong>.
+            </p>
+            {["Live arrivals anywhere in the five boroughs","Push alerts before disruptions hit your line","Unlimited saved routes & stops"].map(t=>(
+              <div key={t} style={{display:"flex",gap:10,marginBottom:8}}>
+                <span style={{color:"#FCCC0A",flexShrink:0}}>⚡</span>
+                <span style={{fontSize:13,color:"#d8d8db"}}>{t}</span>
+              </div>
+            ))}
+            <button onClick={onClose} style={{width:"100%",background:"#F2F1ED",color:"#121214",border:"none",borderRadius:10,padding:"13px 0",fontSize:15,fontWeight:600,cursor:"pointer",marginTop:14,marginBottom:8}}>
+              Try Transit+ — $3.99/mo
+            </button>
+            <button onClick={onClose} style={{width:"100%",background:"none",border:"none",color:"#73737a",fontSize:13,cursor:"pointer",padding:"4px 0"}}>
+              Not now
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    function StopRow({ stop, locked, onLocked, saved, onToggleSave, arrivalsData }) {
+      const arrivals = (arrivalsData&&arrivalsData[stop.id])||[];
+      const lines = stop.lines&&stop.lines.length ? stop.lines : [...new Set(arrivals.map(a=>a.line))];
+      const isBus = stop.isBus||stop.type==="bus";
+      return (
+        <div style={{border:"1px solid #232326",borderRadius:14,padding:"14px 16px",marginBottom:10,background:"#121214",filter:locked?"saturate(0.35)":"none"}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+            <div style={{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}}>
+              {lines.length>0 ? lines.slice(0,6).map((l,i)=><Bullet key={i} line={l} size={22}/>) : <span style={{fontSize:11,color:"#5a5a5f",textTransform:"uppercase"}}>{isBus?"Bus stop":"Station"}</span>}
+            </div>
+            <button onClick={()=>onToggleSave(stop.id)} style={{background:"none",border:"none",cursor:"pointer",fontSize:18,color:saved?"#FCCC0A":"#4a4a4f"}}>
+              {saved?"★":"☆"}
+            </button>
+          </div>
+          <div style={{marginTop:10,display:"flex",justifyContent:"space-between",alignItems:"baseline"}}>
+            <h3 style={{fontFamily:"Fraunces,serif",fontSize:16,margin:0,color:"#F2F1ED"}}>{stop.name}</h3>
+            <span style={{fontSize:12,color:"#73737a"}}>{stop.distMiles!=null?stop.distMiles.toFixed(2):(stop.dist||"")} mi</span>
+          </div>
+          {locked ? (
+            <button onClick={()=>onLocked(stop.name)} style={{marginTop:10,width:"100%",display:"flex",alignItems:"center",justifyContent:"center",gap:6,background:"#1b1b1e",border:"1px dashed #35353a",borderRadius:10,padding:"10px 0",color:"#9a9a9e",fontSize:13,cursor:"pointer"}}>
+              🔒 Unlock arrival times
+            </button>
+          ) : (
+            <div style={{marginTop:10,display:"flex",flexDirection:"column",gap:6}}>
+              {arrivals.length===0
+                ? <span style={{fontSize:12,color:"#5a5a5f"}}>Loading arrivals…</span>
+                : arrivals.map((a,i)=>(
+                  <div key={i} style={{display:"flex",alignItems:"center",gap:10}}>
+                    <Bullet line={a.line} size={20}/>
+                    <span style={{fontSize:13,color:"#b3b3b8",flex:1}}>to {a.dest}</span>
+                    <span style={{fontSize:14,fontWeight:700,color:"#F2F1ED",fontFamily:"monospace"}}>
+                      {a.mins[0]}<span style={{fontSize:11,color:"#73737a",fontWeight:400}}> min</span>
+                    </span>
+                  </div>
+                ))
+              }
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    function RoutePlanner({ onNeedsPaywall }) {
+      const stations = Object.keys(STATION_GRAPH);
+      const [origin, setOrigin] = useState(stations[0]);
+      const [dest, setDest] = useState(stations[2]);
+      const [routes, setRoutes] = useState(null);
+      const [searched, setSearched] = useState(false);
+      const FREE = new Set(["Union Sq","14 St (8 Av)"]);
+      const search = () => {
+        if(!FREE.has(origin)||!FREE.has(dest)){onNeedsPaywall("Unlock citywide route planning");return;}
+        setRoutes(findRoutes(origin,dest)); setSearched(true);
+      };
+      return (
+        <div style={{background:"#121214",border:"1px solid #232326",borderRadius:14,padding:16,marginTop:6}}>
+          <h3 style={{fontFamily:"Fraunces,serif",fontSize:17,margin:"0 0 14px"}}>Compare routes</h3>
+          {[["From",origin,setOrigin],["To",dest,setDest]].map(([label,val,set])=>(
+            <div key={label} style={{marginBottom:10}}>
+              <label style={{fontSize:11,color:"#73737a",display:"block",marginBottom:4}}>{label}</label>
+              <select value={val} onChange={e=>set(e.target.value)} style={{width:"100%",background:"#16161a",border:"1px solid #232326",borderRadius:8,padding:"9px 10px",color:"#F2F1ED",fontSize:13.5}}>
+                {stations.map(s=><option key={s} value={s}>{s}</option>)}
+              </select>
+            </div>
+          ))}
+          <button onClick={search} disabled={origin===dest} style={{width:"100%",background:origin===dest?"#2a2a2d":"#F2F1ED",color:origin===dest?"#73737a":"#0a0a0b",border:"none",borderRadius:9,padding:"11px 0",fontSize:14,fontWeight:600,cursor:origin===dest?"default":"pointer",marginBottom:10}}>
+            Find routes
+          </button>
+          {searched&&(!routes||routes.length===0)&&<p style={{fontSize:13,color:"#73737a"}}>No route found.</p>}
+          {routes&&routes.map((r,i)=>(
+            <div key={i} style={{border:"1px solid #232326",borderRadius:10,padding:"12px 14px",background:"#16161a",marginBottom:8}}>
+              <div style={{display:"flex",justifyContent:"space-between",marginBottom:8}}>
+                <span style={{fontSize:18,fontWeight:700,fontFamily:"monospace"}}>{r.totalMins} min</span>
+                <span style={{fontSize:12,color:i===0?"#5fae6e":"#73737a"}}>{i===0?"Fastest":r.transfers===0?"No transfers":`${r.transfers} transfer${r.transfers>1?"s":""}`}</span>
+              </div>
+              <div style={{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}}>
+                {r.legs.map((leg,j)=>(
+                  <React.Fragment key={j}>
+                    <Bullet line={leg.line} size={20}/>
+                    {j<r.legs.length-1&&leg.line!==r.legs[j+1].line&&<span style={{color:"#5a5a5f"}}>›</span>}
+                  </React.Fragment>
+                ))}
+                <span style={{fontSize:11,color:"#73737a",marginLeft:4}}>via {r.legs.map(l=>l.to).join(" → ")}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      );
+    }
+
+    function App() {
+      const [tab, setTab] = useState("nearby");
+      const [paywall, setPaywall] = useState(null);
+      const [saved, setSaved] = useState({});
+      const [query, setQuery] = useState("");
+      const [locationStatus, setLocationStatus] = useState("loading");
+      const [nearbyStations, setNearbyStations] = useState([]);
+      const [nearbyBusStops, setNearbyBusStops] = useState([]);
+      const [liveArrivals, setLiveArrivals] = useState({});
+      const [liveAlerts, setLiveAlerts] = useState([]);
+      const [usingLiveData, setUsingLiveData] = useState(false);
+      const [searchResults, setSearchResults] = useState({ stations:[], busStops:[] });
+
+      useEffect(()=>{
+        let cancelled=false;
+        async function init(){
+          try{
+            const {lat,lng}=await getUserLocation();
+            if(cancelled)return;
+            setLocationStatus("granted");
+            const [sd,bd]=await Promise.all([fetchNearbyStations(lat,lng),fetchNearbyBusStops(lat,lng)]);
+            if(cancelled)return;
+            setNearbyStations((sd.stations||[]).map(s=>({...s,type:"subway"})));
+            setNearbyBusStops((bd.stops||[]).map(s=>({...s,type:"bus",isBus:true})));
+          }catch(err){
+            if(!cancelled)setLocationStatus(err.code===1?"denied":"error");
+          }
+        }
+        init();
+        return()=>{cancelled=true;};
+      },[]);
+
+      useEffect(()=>{
+        if(nearbyStations.length===0&&nearbyBusStops.length===0)return;
+        let cancelled=false;
+        async function load(){
+          try{
+            const results={};
+            const all=await fetchAllSubwayArrivalsMerged();
+            nearbyStations.forEach(station=>{
+              const matches=all.filter(a=>a.stopId&&a.stopId.startsWith(station.id)).sort((a,b)=>a.arrivalUnix-b.arrivalUnix).slice(0,3);
+              results[station.id]=matches.map(a=>({line:a.line,dest:"—",mins:[Math.max(0,Math.round((a.arrivalUnix*1000-Date.now())/60000))]}));
+            });
+            await Promise.all(nearbyBusStops.map(async stop=>{
+              try{
+                const d=await fetchBusArrivals(stop.id);
+                results[stop.id]=(d.arrivals||[]).slice(0,3).map(a=>({line:a.line||"BUS",dest:a.destination,mins:a.expectedArrival?[Math.max(0,Math.round((new Date(a.expectedArrival)-Date.now())/60000))]:[]}));
+              }catch{results[stop.id]=[];}
+            }));
+            const alertData=await fetchAlertsLive();
+            if(!cancelled){
+              setLiveArrivals(results);
+              setLiveAlerts((alertData.alerts||[]).slice(0,3).map(a=>({id:a.id,line:a.lines?.[0]||"—",text:a.text})));
+              setUsingLiveData(true);
+            }
+          }catch(err){console.warn("Live data unavailable:",err.message);}
+        }
+        load();
+        const interval=setInterval(load,30000);
+        return()=>{cancelled=true;clearInterval(interval);};
+      },[nearbyStations,nearbyBusStops]);
+
+      useEffect(()=>{
+        if(tab!=="explore"||query.trim().length<2){setSearchResults({stations:[],busStops:[]});return;}
+        let cancelled=false;
+        const t=setTimeout(async()=>{
+          try{const res=await searchStations(query.trim());if(!cancelled)setSearchResults(res);}
+          catch(err){console.warn("Search failed:",err.message);}
+        },350);
+        return()=>{cancelled=true;clearTimeout(t);};
+      },[query,tab]);
+
+      const toggleSave=id=>{
+        setSaved(s=>{
+          const next={...s,[id]:!s[id]};
+          if(Object.values(next).filter(Boolean).length>2&&next[id]){setPaywall("Save unlimited stops");return s;}
+          return next;
+        });
+      };
+
+      return (
+        <div style={{fontFamily:"Inter,sans-serif",background:"#0a0a0b",minHeight:"100vh",color:"#F2F1ED",maxWidth:480,margin:"0 auto",paddingBottom:80}}>
+
+          <div style={{padding:"22px 18px 14px",borderBottom:"1px solid #1c1c1f"}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+              <div>
+                <div style={{fontSize:11,letterSpacing:2,color:"#FCCC0A",textTransform:"uppercase",marginBottom:4}}>NYC Transit</div>
+                <h1 style={{fontFamily:"Fraunces,serif",fontSize:26,margin:0}}>Right now, nearby</h1>
+              </div>
+              <div style={{fontSize:12,color:"#73737a"}}>
+                📍 {locationStatus==="loading"?"Locating…":locationStatus==="granted"?"Your location":locationStatus==="denied"?"Location off":"Unavailable"}
+              </div>
+            </div>
+            <div style={{position:"relative"}}>
+              <span style={{position:"absolute",left:12,top:10,color:"#5a5a5f"}}>🔍</span>
+              <input value={query} onChange={e=>{setQuery(e.target.value);if(tab!=="explore")setTab("explore");}}
+                placeholder="Search any station or bus stop…"
+                style={{width:"100%",background:"#16161a",border:"1px solid #232326",borderRadius:10,padding:"10px 12px 10px 34px",color:"#F2F1ED",fontSize:13.5,outline:"none"}}
+              />
+            </div>
+          </div>
+
+          {(usingLiveData||liveAlerts.length>0)&&(
+            <div style={{padding:"10px 18px 0"}}>
+              {usingLiveData&&(
+                <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:6,fontSize:11,color:"#5fae6e"}}>
+                  <span style={{width:6,height:6,borderRadius:"50%",background:"#5fae6e",display:"inline-block"}}/>
+                  Live MTA data
+                </div>
+              )}
+              {liveAlerts.slice(0,2).map(a=>(
+                <div key={a.id} style={{display:"flex",gap:10,alignItems:"flex-start",background:"#1a1410",border:"1px solid #3a2c12",borderRadius:10,padding:"9px 12px",marginBottom:8}}>
+                  <span style={{color:"#FCCC0A",flexShrink:0}}>⚠</span>
+                  <span style={{fontSize:12.5,color:"#d8c9a3",lineHeight:1.4}}>{a.text}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div style={{display:"flex",gap:4,padding:"10px 18px 0"}}>
+            {["nearby","explore","routes"].map(t=>(
+              <button key={t} onClick={()=>setTab(t)} style={{flex:1,padding:"9px 0",borderRadius:9,border:"none",cursor:"pointer",background:tab===t?"#F2F1ED":"transparent",color:tab===t?"#0a0a0b":"#73737a",fontSize:12,fontWeight:600}}>
+                {t==="nearby"?"Within ¼ mi":t==="explore"?"Anywhere in NYC":"Routes"}
+              </button>
+            ))}
+          </div>
+
+          <div style={{padding:"12px 18px 0"}}>
+            {tab==="nearby"&&(
+              <>
+                {locationStatus==="loading"&&<p style={{fontSize:13,color:"#73737a",marginTop:8}}>Finding what's near you…</p>}
+                {locationStatus==="denied"&&<p style={{fontSize:13,color:"#73737a",lineHeight:1.6,marginTop:8}}>Location access is off. Turn it on in your browser settings, or search for a station above.</p>}
+                {locationStatus==="error"&&<p style={{fontSize:13,color:"#73737a",lineHeight:1.6,marginTop:8}}>Couldn't get your location. Try searching a station above.</p>}
+                {locationStatus==="granted"&&nearbyStations.length===0&&nearbyBusStops.length===0&&(
+                  <p style={{fontSize:13,color:"#73737a",marginTop:8}}>Nothing within ¼ mile — try the search bar or Transit+ for a wider radius.</p>
+                )}
+                {nearbyStations.map(s=><StopRow key={s.id} stop={s} locked={false} onLocked={()=>{}} saved={!!saved[s.id]} onToggleSave={toggleSave} arrivalsData={liveArrivals}/>)}
+                {nearbyBusStops.map(s=><StopRow key={s.id} stop={s} locked={false} onLocked={()=>{}} saved={!!saved[s.id]} onToggleSave={toggleSave} arrivalsData={liveArrivals}/>)}
+              </>
+            )}
+            {tab==="explore"&&(
+              <>
+                <p style={{fontSize:12,color:"#73737a",marginBottom:10}}>Search the full city — arrivals locked past your free radius</p>
+                {query.trim().length<2&&<p style={{fontSize:13,color:"#5a5a5f"}}>Type a station or stop name to search all of NYC.</p>}
+                {searchResults.stations.map(s=><StopRow key={s.id} stop={s} locked={true} onLocked={name=>setPaywall(`See live arrivals at ${name}`)} saved={!!saved[s.id]} onToggleSave={toggleSave} arrivalsData={{}}/>)}
+                {searchResults.busStops.map(s=><StopRow key={s.id} stop={{...s,isBus:true}} locked={true} onLocked={name=>setPaywall(`See live arrivals at ${name}`)} saved={!!saved[s.id]} onToggleSave={toggleSave} arrivalsData={{}}/>)}
+              </>
+            )}
+            {tab==="routes"&&(
+              <>
+                <RoutePlanner onNeedsPaywall={r=>setPaywall(r)}/>
+                <p style={{fontSize:11.5,color:"#5a5a5f",marginTop:10,lineHeight:1.5}}>Free routes limited to nearby stations. Citywide routing needs Transit+.</p>
+              </>
+            )}
+          </div>
+
+          {paywall&&<PaywallModal reason={paywall} onClose={()=>setPaywall(null)}/>}
+        </div>
+      );
+    }
+
+    ReactDOM.render(<App/>, document.getElementById("root"));
+  </script>
+</body>
+</html>
